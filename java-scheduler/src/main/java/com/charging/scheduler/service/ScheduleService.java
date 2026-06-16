@@ -5,6 +5,7 @@ import com.charging.scheduler.model.ChargingPile;
 import com.charging.scheduler.model.PowerMetric;
 import com.charging.scheduler.repository.ChargingPileRepository;
 import com.charging.scheduler.repository.PowerMetricRepository;
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
@@ -22,6 +23,7 @@ import java.util.stream.Collectors;
 public class ScheduleService {
 
     private static final double DEFAULT_VOLTAGE = 400.0;
+    private static final double FALLBACK_MAX_POWER = 1000.0;
 
     private final ChargingPileRepository chargingPileRepository;
     private final PowerMetricRepository powerMetricRepository;
@@ -45,7 +47,12 @@ public class ScheduleService {
         this.chargingPileRepository = chargingPileRepository;
         this.powerMetricRepository = powerMetricRepository;
         this.restTemplate = restTemplate;
-        this.currentMaxTotalPowerKw = defaultMaxTotalPowerKw;
+    }
+
+    @PostConstruct
+    public void init() {
+        this.currentMaxTotalPowerKw = defaultMaxTotalPowerKw > 0 ? defaultMaxTotalPowerKw : FALLBACK_MAX_POWER;
+        log.info("ScheduleService initialized with default max total power: {}kW", this.currentMaxTotalPowerKw);
     }
 
     public Map<String, Double> getCurrentTotalPower() {
@@ -54,18 +61,28 @@ public class ScheduleService {
         Map<String, Double> pileMaxPower = new HashMap<>();
 
         for (ChargingPile pile : onlinePiles) {
-            List<PowerMetric> metrics = powerMetricRepository.findMaxPowerByPileIdSince(pile.getPileId(), since);
-            if (!metrics.isEmpty()) {
+            String pileId = pile.getPileId();
+            if (pileId == null || pileId.trim().isEmpty()) {
+                continue;
+            }
+            List<PowerMetric> metrics = powerMetricRepository.findMaxPowerByPileIdSince(pileId, since);
+            if (!metrics.isEmpty() && metrics.get(0) != null) {
                 Double maxPower = metrics.get(0).getPower();
-                if (maxPower != null && maxPower > 0) {
-                    pileMaxPower.put(pile.getPileId(), maxPower);
+                if (maxPower != null) {
+                    pileMaxPower.put(pileId, Math.max(maxPower, 0.0));
+                } else {
+                    pileMaxPower.put(pileId, 0.0);
                 }
+            } else {
+                pileMaxPower.put(pileId, 0.0);
             }
         }
 
-        if (pileMaxPower.isEmpty()) {
+        if (pileMaxPower.isEmpty() && !onlinePiles.isEmpty()) {
             for (ChargingPile pile : onlinePiles) {
-                pileMaxPower.put(pile.getPileId(), 0.0);
+                if (pile.getPileId() != null) {
+                    pileMaxPower.put(pile.getPileId(), 0.0);
+                }
             }
         }
 
@@ -73,15 +90,30 @@ public class ScheduleService {
     }
 
     public ScheduleResponse allocatePower(Double maxTotalPowerKw, List<PileLimitDTO> pileLimits, String reason) {
-        double effectiveMax = (maxTotalPowerKw != null) ? maxTotalPowerKw :
-                (currentMaxTotalPowerKw != null ? currentMaxTotalPowerKw : defaultMaxTotalPowerKw);
+        double effectiveMax;
+        if (maxTotalPowerKw != null) {
+            effectiveMax = maxTotalPowerKw;
+        } else if (currentMaxTotalPowerKw != null) {
+            effectiveMax = currentMaxTotalPowerKw;
+        } else {
+            effectiveMax = defaultMaxTotalPowerKw > 0 ? defaultMaxTotalPowerKw : FALLBACK_MAX_POWER;
+        }
+
+        if (effectiveMax <= 0) {
+            effectiveMax = FALLBACK_MAX_POWER;
+            log.warn("Effective max power was <= 0, using fallback: {}kW", effectiveMax);
+        }
 
         Map<String, Double> currentPilePowers = getCurrentTotalPower();
-        double totalCurrentPower = currentPilePowers.values().stream().mapToDouble(Double::doubleValue).sum();
+        double totalCurrentPower = currentPilePowers.values().stream()
+                .filter(Objects::nonNull)
+                .mapToDouble(Double::doubleValue)
+                .sum();
 
         List<ChargingPile> onlinePiles = chargingPileRepository.findAllOnlinePiles();
         Map<String, ChargingPile> pileMap = onlinePiles.stream()
-                .collect(Collectors.toMap(ChargingPile::getPileId, p -> p));
+                .filter(p -> p != null && p.getPileId() != null)
+                .collect(Collectors.toMap(ChargingPile::getPileId, p -> p, (p1, p2) -> p1));
 
         Map<String, Double> originalMaxCurrentMap = new HashMap<>();
         Map<String, Double> limitedMaxCurrentMap = new HashMap<>();
@@ -179,18 +211,32 @@ public class ScheduleService {
     }
 
     private void notifyCollector(CollectorLimitRequest request) {
+        if (request == null) {
+            log.warn("notifyCollector called with null request, skipping");
+            return;
+        }
+        if (collectorUrl == null || collectorUrl.trim().isEmpty()) {
+            log.warn("collectorUrl is not configured, skipping notification");
+            return;
+        }
         try {
             String url = collectorUrl + "/api/v1/limit";
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             HttpEntity<CollectorLimitRequest> entity = new HttpEntity<>(request, headers);
 
+            log.info("Notifying collector at {} with {} pile limits, maxTotalPower={}kW",
+                    url, request.getPileLimits() != null ? request.getPileLimits().size() : 0,
+                    request.getMaxTotalPowerKw());
+
             ResponseEntity<String> response = restTemplate.exchange(
                     url, HttpMethod.POST, entity, String.class);
 
-            log.info("Collector notified successfully, status: {}", response.getStatusCode());
+            log.info("Collector notified successfully, status: {}, response: {}",
+                    response.getStatusCode(),
+                    response.getBody() != null ? response.getBody().substring(0, Math.min(200, response.getBody().length())) : "empty");
         } catch (Exception e) {
-            log.warn("Failed to notify collector at {}: {}", collectorUrl, e.getMessage());
+            log.error("Failed to notify collector at {}: {}", collectorUrl, e.getMessage(), e);
         }
     }
 
@@ -205,12 +251,24 @@ public class ScheduleService {
     }
 
     public ScheduleResponse emergencyLimit(EmergencyLimitRequest request) {
+        if (request == null) {
+            throw new IllegalArgumentException("Emergency limit request cannot be null");
+        }
+        if (request.getMaxTotalPowerKw() == null || request.getMaxTotalPowerKw() <= 0) {
+            throw new IllegalArgumentException("Invalid maxTotalPowerKw: " + request.getMaxTotalPowerKw());
+        }
         log.warn("Emergency limit activated: {}kW, reason: {}", request.getMaxTotalPowerKw(), request.getReason());
         lastEmergencyReason = request.getReason();
         return allocatePower(request.getMaxTotalPowerKw(), null, request.getReason());
     }
 
     public ScheduleResponse manualLimit(LimitRequest request) {
+        if (request == null) {
+            throw new IllegalArgumentException("Limit request cannot be null");
+        }
+        if (request.getMaxTotalPowerKw() == null || request.getMaxTotalPowerKw() <= 0) {
+            throw new IllegalArgumentException("Invalid maxTotalPowerKw: " + request.getMaxTotalPowerKw());
+        }
         log.info("Manual limit triggered: {}kW", request.getMaxTotalPowerKw());
         lastEmergencyReason = null;
         return allocatePower(request.getMaxTotalPowerKw(), request.getPileLimits(), null);
@@ -218,8 +276,16 @@ public class ScheduleService {
 
     public ScheduleResponse getStatus() {
         Map<String, Double> currentPilePowers = getCurrentTotalPower();
-        double totalCurrentPower = currentPilePowers.values().stream().mapToDouble(Double::doubleValue).sum();
-        double effectiveMax = currentMaxTotalPowerKw != null ? currentMaxTotalPowerKw : defaultMaxTotalPowerKw;
+        double totalCurrentPower = currentPilePowers.values().stream()
+                .filter(Objects::nonNull)
+                .mapToDouble(Double::doubleValue)
+                .sum();
+        double effectiveMax;
+        if (currentMaxTotalPowerKw != null) {
+            effectiveMax = currentMaxTotalPowerKw;
+        } else {
+            effectiveMax = defaultMaxTotalPowerKw > 0 ? defaultMaxTotalPowerKw : FALLBACK_MAX_POWER;
+        }
 
         List<ChargingPile> onlinePiles = chargingPileRepository.findAllOnlinePiles();
         List<ScheduleResponse.PileStatusDTO> pileStatusDtos = new ArrayList<>();
@@ -264,9 +330,10 @@ public class ScheduleService {
     }
 
     public void resetToDefault() {
-        currentMaxTotalPowerKw = defaultMaxTotalPowerKw;
+        double effectiveDefault = defaultMaxTotalPowerKw > 0 ? defaultMaxTotalPowerKw : FALLBACK_MAX_POWER;
+        currentMaxTotalPowerKw = effectiveDefault;
         lastEmergencyReason = null;
         activePileLimits.clear();
-        log.info("Scheduler reset to default max total power: {}kW", defaultMaxTotalPowerKw);
+        log.info("Scheduler reset to default max total power: {}kW", effectiveDefault);
     }
 }

@@ -24,10 +24,12 @@ public class ScheduleService {
 
     private static final double DEFAULT_VOLTAGE = 400.0;
     private static final double FALLBACK_MAX_POWER = 1000.0;
+    private static final int FORECAST_POINTS = 30;
 
     private final ChargingPileRepository chargingPileRepository;
     private final PowerMetricRepository powerMetricRepository;
     private final RestTemplate restTemplate;
+    private final SmoothTransitionManager transitionManager;
 
     @Value("${scheduler.default-max-total-power-kw:1000}")
     private double defaultMaxTotalPowerKw;
@@ -43,16 +45,27 @@ public class ScheduleService {
 
     public ScheduleService(ChargingPileRepository chargingPileRepository,
                            PowerMetricRepository powerMetricRepository,
-                           RestTemplate restTemplate) {
+                           RestTemplate restTemplate,
+                           SmoothTransitionManager transitionManager) {
         this.chargingPileRepository = chargingPileRepository;
         this.powerMetricRepository = powerMetricRepository;
         this.restTemplate = restTemplate;
+        this.transitionManager = transitionManager;
     }
 
     @PostConstruct
     public void init() {
         this.currentMaxTotalPowerKw = defaultMaxTotalPowerKw > 0 ? defaultMaxTotalPowerKw : FALLBACK_MAX_POWER;
         log.info("ScheduleService initialized with default max total power: {}kW", this.currentMaxTotalPowerKw);
+
+        transitionManager.setStepCallback(currentPowerLimit -> {
+            log.info("Smooth transition step: applying power limit {}kW", currentPowerLimit);
+            try {
+                allocatePowerInternal(currentPowerLimit, null, null);
+            } catch (Exception e) {
+                log.error("Error in transition step callback", e);
+            }
+        });
     }
 
     public Map<String, Double> getCurrentTotalPower() {
@@ -90,6 +103,27 @@ public class ScheduleService {
     }
 
     public ScheduleResponse allocatePower(Double maxTotalPowerKw, List<PileLimitDTO> pileLimits, String reason) {
+        return allocatePower(maxTotalPowerKw, pileLimits, reason, 0);
+    }
+
+    public ScheduleResponse allocatePower(Double maxTotalPowerKw, List<PileLimitDTO> pileLimits,
+                                          String reason, int transitionMinutes) {
+        if (transitionMinutes > 0 && maxTotalPowerKw != null) {
+            double startPower = currentMaxTotalPowerKw != null ? currentMaxTotalPowerKw : FALLBACK_MAX_POWER;
+            log.info("Starting smooth transition: {}kW -> {}kW over {} minutes",
+                    startPower, maxTotalPowerKw, transitionMinutes);
+            transitionManager.startTransition(startPower, maxTotalPowerKw, transitionMinutes, reason);
+
+            ScheduleResponse response = allocatePowerInternal(startPower, pileLimits, reason);
+            response.setTransition(buildTransitionInfo());
+            return response;
+        } else {
+            transitionManager.cancelCurrentTransition();
+            return allocatePowerInternal(maxTotalPowerKw, pileLimits, reason);
+        }
+    }
+
+    private ScheduleResponse allocatePowerInternal(Double maxTotalPowerKw, List<PileLimitDTO> pileLimits, String reason) {
         double effectiveMax;
         if (maxTotalPowerKw != null) {
             effectiveMax = maxTotalPowerKw;
@@ -119,12 +153,15 @@ public class ScheduleService {
         Map<String, Double> limitedMaxCurrentMap = new HashMap<>();
 
         for (ChargingPile pile : onlinePiles) {
-            originalMaxCurrentMap.put(pile.getPileId(), pile.getMaxCurrentAmps());
+            if (pile.getPileId() != null) {
+                originalMaxCurrentMap.put(pile.getPileId(),
+                        pile.getMaxCurrentAmps() != null ? pile.getMaxCurrentAmps() : 250.0);
+            }
         }
 
         if (pileLimits != null && !pileLimits.isEmpty()) {
             for (PileLimitDTO limit : pileLimits) {
-                if (pileMap.containsKey(limit.getPileId()) && limit.getMaxCurrentAmps() != null) {
+                if (limit != null && pileMap.containsKey(limit.getPileId()) && limit.getMaxCurrentAmps() != null) {
                     limitedMaxCurrentMap.put(limit.getPileId(),
                             Math.min(limit.getMaxCurrentAmps(), originalMaxCurrentMap.get(limit.getPileId())));
                 }
@@ -134,12 +171,17 @@ public class ScheduleService {
         if (totalCurrentPower > effectiveMax && totalCurrentPower > 0) {
             double scaleFactor = effectiveMax / totalCurrentPower;
             log.info("Total power {}kW exceeds limit {}kW, applying scale factor: {}",
-                    totalCurrentPower, effectiveMax, scaleFactor);
+                    String.format("%.2f", totalCurrentPower),
+                    String.format("%.2f", effectiveMax),
+                    String.format("%.4f", scaleFactor));
 
             for (ChargingPile pile : onlinePiles) {
                 String pileId = pile.getPileId();
-                Double pilePower = currentPilePowers.getOrDefault(pileId, 0.0);
-                double originalMaxCurrent = originalMaxCurrentMap.get(pileId);
+                if (pileId == null) continue;
+
+                Double pilePowerObj = currentPilePowers.get(pileId);
+                double pilePower = pilePowerObj != null ? pilePowerObj : 0.0;
+                double originalMaxCurrent = originalMaxCurrentMap.getOrDefault(pileId, 250.0);
                 double limitedCurrent;
 
                 if (pilePower > 0) {
@@ -159,7 +201,9 @@ public class ScheduleService {
 
         for (ChargingPile pile : onlinePiles) {
             String pileId = pile.getPileId();
-            double original = originalMaxCurrentMap.get(pileId);
+            if (pileId == null) continue;
+
+            double original = originalMaxCurrentMap.getOrDefault(pileId, 250.0);
             double limited = limitedMaxCurrentMap.getOrDefault(pileId, original);
             boolean isLimited = Math.abs(limited - original) > 0.01;
 
@@ -168,9 +212,10 @@ public class ScheduleService {
                     .maxCurrentAmps(limited)
                     .build());
 
+            Double currentPower = currentPilePowers.get(pileId);
             pileStatusDtos.add(ScheduleResponse.PileStatusDTO.builder()
                     .pileId(pileId)
-                    .currentPowerKw(currentPilePowers.getOrDefault(pileId, 0.0))
+                    .currentPowerKw(currentPower != null ? currentPower : 0.0)
                     .originalMaxCurrentAmps(original)
                     .limitedMaxCurrentAmps(limited)
                     .isLimited(isLimited)
@@ -196,6 +241,13 @@ public class ScheduleService {
         if (reason != null && !reason.isEmpty()) {
             alerts.add("EMERGENCY: " + reason);
         }
+        if (transitionManager.isTransitionInProgress()) {
+            SmoothTransitionManager.TransitionState state = transitionManager.getCurrentState();
+            if (state != null) {
+                alerts.add(String.format("TRANSITION: Smooth transition in progress (step %d/%d)",
+                        state.getCurrentStep(), state.getTotalSteps()));
+            }
+        }
 
         currentMaxTotalPowerKw = effectiveMax;
 
@@ -207,6 +259,30 @@ public class ScheduleService {
                 .pileStatuses(pileStatusDtos)
                 .alerts(alerts)
                 .timestamp(LocalDateTime.now())
+                .build();
+    }
+
+    private ScheduleResponse.TransitionInfoDTO buildTransitionInfo() {
+        SmoothTransitionManager.TransitionState state = transitionManager.getCurrentState();
+        if (state == null) {
+            return null;
+        }
+
+        double progressPercent = state.getTotalSteps() > 0
+                ? (double) state.getCurrentStep() / state.getTotalSteps() * 100.0
+                : 0.0;
+
+        return ScheduleResponse.TransitionInfoDTO.builder()
+                .inProgress(state.isInProgress())
+                .startPowerKw(state.getStartPowerKw())
+                .targetPowerKw(state.getTargetPowerKw())
+                .startTime(state.getStartTime())
+                .endTime(state.getEndTime())
+                .currentStep(state.getCurrentStep())
+                .totalSteps(state.getTotalSteps())
+                .progressPercent(progressPercent)
+                .forecastPowers(transitionManager.generateForecastPoints(FORECAST_POINTS))
+                .reason(state.getReason())
                 .build();
     }
 
@@ -225,16 +301,14 @@ public class ScheduleService {
             headers.setContentType(MediaType.APPLICATION_JSON);
             HttpEntity<CollectorLimitRequest> entity = new HttpEntity<>(request, headers);
 
-            log.info("Notifying collector at {} with {} pile limits, maxTotalPower={}kW",
+            log.debug("Notifying collector at {} with {} pile limits, maxTotalPower={}kW",
                     url, request.getPileLimits() != null ? request.getPileLimits().size() : 0,
                     request.getMaxTotalPowerKw());
 
             ResponseEntity<String> response = restTemplate.exchange(
                     url, HttpMethod.POST, entity, String.class);
 
-            log.info("Collector notified successfully, status: {}, response: {}",
-                    response.getStatusCode(),
-                    response.getBody() != null ? response.getBody().substring(0, Math.min(200, response.getBody().length())) : "empty");
+            log.debug("Collector notified successfully, status: {}", response.getStatusCode());
         } catch (Exception e) {
             log.error("Failed to notify collector at {}: {}", collectorUrl, e.getMessage(), e);
         }
@@ -244,7 +318,11 @@ public class ScheduleService {
     public void schedule() {
         log.debug("Running scheduled power allocation...");
         try {
-            allocatePower(currentMaxTotalPowerKw, null, null);
+            if (transitionManager.isTransitionInProgress()) {
+                log.debug("Transition in progress, skipping scheduled allocation");
+                return;
+            }
+            allocatePowerInternal(currentMaxTotalPowerKw, null, null);
         } catch (Exception e) {
             log.error("Scheduled power allocation failed", e);
         }
@@ -257,9 +335,14 @@ public class ScheduleService {
         if (request.getMaxTotalPowerKw() == null || request.getMaxTotalPowerKw() <= 0) {
             throw new IllegalArgumentException("Invalid maxTotalPowerKw: " + request.getMaxTotalPowerKw());
         }
-        log.warn("Emergency limit activated: {}kW, reason: {}", request.getMaxTotalPowerKw(), request.getReason());
+
+        int transitionMin = request.getTransitionMinutes() != null ? request.getTransitionMinutes() : 0;
+
+        log.warn("Emergency limit activated: {}kW, reason: {}, transition: {}min",
+                request.getMaxTotalPowerKw(), request.getReason(), transitionMin);
+
         lastEmergencyReason = request.getReason();
-        return allocatePower(request.getMaxTotalPowerKw(), null, request.getReason());
+        return allocatePower(request.getMaxTotalPowerKw(), null, request.getReason(), transitionMin);
     }
 
     public ScheduleResponse manualLimit(LimitRequest request) {
@@ -269,9 +352,13 @@ public class ScheduleService {
         if (request.getMaxTotalPowerKw() == null || request.getMaxTotalPowerKw() <= 0) {
             throw new IllegalArgumentException("Invalid maxTotalPowerKw: " + request.getMaxTotalPowerKw());
         }
-        log.info("Manual limit triggered: {}kW", request.getMaxTotalPowerKw());
+
+        int transitionMin = request.getTransitionMinutes() != null ? request.getTransitionMinutes() : 0;
+
+        log.info("Manual limit triggered: {}kW, transition: {}min", request.getMaxTotalPowerKw(), transitionMin);
+
         lastEmergencyReason = null;
-        return allocatePower(request.getMaxTotalPowerKw(), request.getPileLimits(), null);
+        return allocatePower(request.getMaxTotalPowerKw(), request.getPileLimits(), null, transitionMin);
     }
 
     public ScheduleResponse getStatus() {
@@ -292,13 +379,16 @@ public class ScheduleService {
 
         for (ChargingPile pile : onlinePiles) {
             String pileId = pile.getPileId();
-            double original = pile.getMaxCurrentAmps();
+            if (pileId == null) continue;
+
+            double original = pile.getMaxCurrentAmps() != null ? pile.getMaxCurrentAmps() : 250.0;
             double limited = activePileLimits.getOrDefault(pileId, original);
             boolean isLimited = Math.abs(limited - original) > 0.01;
 
+            Double currentPower = currentPilePowers.get(pileId);
             pileStatusDtos.add(ScheduleResponse.PileStatusDTO.builder()
                     .pileId(pileId)
-                    .currentPowerKw(currentPilePowers.getOrDefault(pileId, 0.0))
+                    .currentPowerKw(currentPower != null ? currentPower : 0.0)
                     .originalMaxCurrentAmps(original)
                     .limitedMaxCurrentAmps(limited)
                     .isLimited(isLimited)
@@ -313,6 +403,15 @@ public class ScheduleService {
         if (lastEmergencyReason != null) {
             alerts.add("EMERGENCY ACTIVE: " + lastEmergencyReason);
         }
+        if (transitionManager.isTransitionInProgress()) {
+            SmoothTransitionManager.TransitionState state = transitionManager.getCurrentState();
+            if (state != null) {
+                alerts.add(String.format("TRANSITION: Smooth transition %s → %s kW (%.1f%%)",
+                        formatKW(state.getStartPowerKw()),
+                        formatKW(state.getTargetPowerKw()),
+                        state.getTotalSteps() > 0 ? (double) state.getCurrentStep() / state.getTotalSteps() * 100 : 0));
+            }
+        }
         long offlineCount = chargingPileRepository.count() - onlinePiles.size();
         if (offlineCount > 0) {
             alerts.add(String.format("INFO: %d piles are offline/fault", offlineCount));
@@ -325,11 +424,17 @@ public class ScheduleService {
                 .currentTotalPowerKw(totalCurrentPower)
                 .pileStatuses(pileStatusDtos)
                 .alerts(alerts)
+                .transition(buildTransitionInfo())
                 .timestamp(LocalDateTime.now())
                 .build();
     }
 
+    private String formatKW(double kw) {
+        return String.format("%.0f", kw);
+    }
+
     public void resetToDefault() {
+        transitionManager.cancelCurrentTransition();
         double effectiveDefault = defaultMaxTotalPowerKw > 0 ? defaultMaxTotalPowerKw : FALLBACK_MAX_POWER;
         currentMaxTotalPowerKw = effectiveDefault;
         lastEmergencyReason = null;

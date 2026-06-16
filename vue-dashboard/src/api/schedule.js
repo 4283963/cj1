@@ -17,10 +17,11 @@ export const getStatus = () => {
   return request.get('/v1/schedule/status')
 }
 
-export const emergencyLimit = (maxTotalPowerKw, reason) => {
+export const emergencyLimit = (maxTotalPowerKw, reason, transitionMinutes = 0) => {
   return request.post('/v1/schedule/emergency', {
     maxTotalPowerKw,
-    reason
+    reason,
+    transitionMinutes
   })
 }
 

@@ -57,6 +57,23 @@
         </div>
       </div>
       
+      <div class="status-card transition-card" v-if="statusData.transition?.inProgress">
+        <div class="status-icon transition-icon">
+          <el-icon><Refresh /></el-icon>
+        </div>
+        <div class="status-info">
+          <span class="status-label">平滑降载中</span>
+          <span class="status-value transition-value">
+            {{ formatPower(statusData.transition.currentPowerKw) }} → {{ formatPower(statusData.transition.targetPowerKw) }}
+            <span class="unit">kW</span>
+          </span>
+          <div class="transition-progress-bar">
+            <div class="transition-progress-fill" :style="{ width: transitionProgress + '%' }"></div>
+          </div>
+          <span class="transition-remain">剩余约 {{ remainingMinutes }} 分钟</span>
+        </div>
+      </div>
+      
       <div class="status-card">
         <div class="status-icon time-icon">
           <el-icon><Clock /></el-icon>
@@ -66,6 +83,14 @@
           <span class="status-value time-value">{{ currentTime }}</span>
         </div>
       </div>
+    </section>
+
+    <section class="chart-section">
+      <div class="section-header">
+        <h2><span class="decorate"></span>总功率趋势预测</h2>
+        <span class="section-subtitle">Total Power Forecast</span>
+      </div>
+      <div ref="trendChartRef" class="trend-chart-container"></div>
     </section>
 
     <section class="chart-section">
@@ -144,6 +169,17 @@
           />
           <span class="form-unit">kW</span>
         </el-form-item>
+        <el-form-item label="过渡时间" prop="transitionMinutes">
+          <el-select v-model="emergencyForm.transitionMinutes" size="large" style="width: 100%">
+            <el-option :value="0" label="立即生效" />
+            <el-option :value="1" label="1 分钟内平滑降载" />
+            <el-option :value="3" label="3 分钟内平滑降载" />
+            <el-option :value="5" label="5 分钟内平滑降载" />
+            <el-option :value="10" label="10 分钟内平滑降载" />
+            <el-option :value="15" label="15 分钟内平滑降载" />
+            <el-option :value="30" label="30 分钟内平滑降载" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="限电原因" prop="reason">
           <el-input 
             v-model="emergencyForm.reason" 
@@ -173,14 +209,20 @@ import * as echarts from 'echarts'
 import { getStatus, emergencyLimit, resetSchedule } from '@/api/schedule'
 
 const chartRef = ref(null)
+const trendChartRef = ref(null)
 let chartInstance = null
+let trendChartInstance = null
 let pollTimer = null
 let timeTimer = null
+
+const MAX_HISTORY_POINTS = 20
+const powerHistory = ref([])
 
 const showEmergencyDialog = ref(false)
 const emergencyLoading = ref(false)
 const emergencyForm = reactive({
   maxTotalPowerKw: 100,
+  transitionMinutes: 5,
   reason: ''
 })
 
@@ -191,7 +233,8 @@ const statusData = reactive({
   currentTotalPowerKw: 0,
   pileStatuses: [],
   alerts: [],
-  timestamp: ''
+  timestamp: '',
+  transition: null
 })
 
 const currentTime = ref('')
@@ -200,6 +243,20 @@ const formatPower = (value) => {
   if (value === null || value === undefined || isNaN(value)) return '0.00'
   return Number(value).toFixed(2)
 }
+
+const transitionProgress = computed(() => {
+  if (!statusData.transition?.inProgress) return 0
+  const current = statusData.transition.currentStep || 0
+  const total = statusData.transition.totalSteps || 1
+  return Math.min(Math.round((current / total) * 100), 100)
+})
+
+const remainingMinutes = computed(() => {
+  if (!statusData.transition?.inProgress) return 0
+  const remainingSteps = (statusData.transition.totalSteps || 0) - (statusData.transition.currentStep || 0)
+  const remainingSeconds = remainingSteps * 10
+  return Math.max(1, Math.ceil(remainingSeconds / 60))
+})
 
 const getPowerPercent = (pile) => {
   if (!pile || !pile.currentPowerKw || !pile.originalMaxCurrentAmps) return 0
@@ -353,8 +410,208 @@ const updateChart = () => {
   })
 }
 
+const initTrendChart = () => {
+  if (!trendChartRef.value) return
+  
+  trendChartInstance = echarts.init(trendChartRef.value, 'dark')
+  
+  const option = {
+    backgroundColor: 'transparent',
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: 'rgba(0, 30, 60, 0.9)',
+      borderColor: '#00d4ff',
+      textStyle: {
+        color: '#fff'
+      },
+      formatter: (params) => {
+        let result = ''
+        params.forEach(p => {
+          result += `${p.marker} ${p.seriesName}: ${p.value?.toFixed?.(2) || p.value} kW<br/>`
+        })
+        return result
+      }
+    },
+    legend: {
+      data: ['当前总功率', '预测功率曲线', '目标功率'],
+      textStyle: {
+        color: '#a0cfff'
+      },
+      top: 10,
+      right: 20
+    },
+    grid: {
+      left: '3%',
+      right: '4%',
+      bottom: '8%',
+      top: '18%',
+      containLabel: true
+    },
+    xAxis: {
+      type: 'category',
+      data: [],
+      axisLine: {
+        lineStyle: {
+          color: '#1e5a8a'
+        }
+      },
+      axisLabel: {
+        color: '#a0cfff',
+        fontSize: 11
+      },
+      axisTick: {
+        show: false
+      }
+    },
+    yAxis: {
+      type: 'value',
+      name: '功率 (kW)',
+      nameTextStyle: {
+        color: '#a0cfff',
+        fontSize: 12
+      },
+      axisLine: {
+        show: false
+      },
+      axisLabel: {
+        color: '#a0cfff'
+      },
+      splitLine: {
+        lineStyle: {
+          color: 'rgba(30, 90, 138, 0.3)',
+          type: 'dashed'
+        }
+      }
+    },
+    series: [
+      {
+        name: '当前总功率',
+        type: 'line',
+        smooth: true,
+        data: [],
+        lineStyle: {
+          color: '#00d4ff',
+          width: 3
+        },
+        itemStyle: {
+          color: '#00d4ff'
+        },
+        areaStyle: {
+          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+            { offset: 0, color: 'rgba(0, 212, 255, 0.3)' },
+            { offset: 1, color: 'rgba(0, 212, 255, 0.02)' }
+          ])
+        },
+        symbol: 'circle',
+        symbolSize: 6
+      },
+      {
+        name: '预测功率曲线',
+        type: 'line',
+        smooth: true,
+        data: [],
+        lineStyle: {
+          color: '#ff9f43',
+          width: 2,
+          type: 'dashed'
+        },
+        itemStyle: {
+          color: '#ff9f43'
+        },
+        symbol: 'none',
+        areaStyle: {
+          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+            { offset: 0, color: 'rgba(255, 159, 67, 0.15)' },
+            { offset: 1, color: 'rgba(255, 159, 67, 0.02)' }
+          ])
+        }
+      },
+      {
+        name: '目标功率',
+        type: 'line',
+        data: [],
+        lineStyle: {
+          color: '#ff6b6b',
+          width: 2,
+          type: 'dotted'
+        },
+        itemStyle: {
+          color: '#ff6b6b'
+        },
+        symbol: 'none'
+      }
+    ]
+  }
+  
+  trendChartInstance.setOption(option)
+}
+
+const updateTrendChart = () => {
+  if (!trendChartInstance) return
+  
+  const now = new Date()
+  const timeStr = now.toTimeString().slice(0, 8)
+  
+  if (statusData.currentTotalPowerKw !== undefined && statusData.currentTotalPowerKw !== null) {
+    powerHistory.value.push({
+      time: timeStr,
+      power: Number(statusData.currentTotalPowerKw.toFixed(2))
+    })
+    
+    if (powerHistory.value.length > MAX_HISTORY_POINTS) {
+      powerHistory.value.shift()
+    }
+  }
+  
+  const historyTimes = powerHistory.value.map(p => p.time)
+  const historyPowers = powerHistory.value.map(p => p.power)
+  
+  let forecastTimes = []
+  let forecastPowers = []
+  let targetLine = []
+  
+  if (statusData.transition && statusData.transition.inProgress && statusData.transition.forecastPowers) {
+    const forecastPoints = statusData.transition.forecastPowers
+    const currentStep = statusData.transition.currentStep || 0
+    const totalSteps = statusData.transition.totalSteps || 1
+    const remainingSteps = totalSteps - currentStep
+    
+    forecastTimes = [...historyTimes]
+    forecastPowers = historyPowers.map(() => null)
+    
+    for (let i = currentStep; i < forecastPoints.length; i++) {
+      const offset = i - currentStep
+      const futureTime = new Date(now.getTime() + offset * 10 * 1000)
+      forecastTimes.push(futureTime.toTimeString().slice(0, 8))
+      forecastPowers.push(Number(forecastPoints[i].toFixed(2)))
+    }
+    
+    targetLine = new Array(forecastTimes.length).fill(
+      Number(statusData.transition.targetPowerKw.toFixed(2))
+    )
+  }
+  
+  trendChartInstance.setOption({
+    xAxis: {
+      data: forecastTimes.length > historyTimes.length ? forecastTimes : historyTimes
+    },
+    series: [
+      {
+        data: historyPowers
+      },
+      {
+        data: forecastPowers
+      },
+      {
+        data: targetLine
+      }
+    ]
+  })
+}
+
 const handleResize = () => {
   chartInstance?.resize()
+  trendChartInstance?.resize()
 }
 
 const fetchStatus = async () => {
@@ -363,6 +620,7 @@ const fetchStatus = async () => {
     if (data) {
       Object.assign(statusData, data)
       updateChart()
+      updateTrendChart()
     }
   } catch (error) {
     console.error('获取状态失败:', error)
@@ -381,7 +639,7 @@ const handleEmergencyLimit = async () => {
   
   try {
     emergencyLoading.value = true
-    await emergencyLimit(emergencyForm.maxTotalPowerKw, emergencyForm.reason)
+    await emergencyLimit(emergencyForm.maxTotalPowerKw, emergencyForm.reason, emergencyForm.transitionMinutes)
     ElMessage.success('紧急限电指令已下发')
     showEmergencyDialog.value = false
     emergencyForm.reason = ''
@@ -431,6 +689,7 @@ onMounted(async () => {
   timeTimer = setInterval(updateCurrentTime, 1000)
   
   await nextTick()
+  initTrendChart()
   initChart()
   window.addEventListener('resize', handleResize)
   
@@ -451,6 +710,11 @@ onUnmounted(() => {
   if (chartInstance) {
     chartInstance.dispose()
     chartInstance = null
+  }
+  
+  if (trendChartInstance) {
+    trendChartInstance.dispose()
+    trendChartInstance = null
   }
 })
 </script>
@@ -593,6 +857,58 @@ onUnmounted(() => {
   color: #9c59ff;
 }
 
+.transition-icon {
+  background: linear-gradient(135deg, rgba(255, 159, 67, 0.2) 0%, rgba(255, 107, 107, 0.2) 100%);
+  color: #ff9f43;
+  animation: spin 2s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.transition-card {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.transition-card .status-icon {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  width: 40px;
+  height: 40px;
+  font-size: 20px;
+}
+
+.transition-value {
+  font-size: 20px !important;
+  color: #ff9f43 !important;
+}
+
+.transition-progress-bar {
+  width: 100%;
+  height: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.transition-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #ff9f43 0%, #ff6b6b 100%);
+  border-radius: 3px;
+  transition: width 0.5s ease;
+}
+
+.transition-remain {
+  font-size: 12px;
+  color: #7fb8e0;
+}
+
 .status-info {
   flex: 1;
   display: flex;
@@ -688,6 +1004,11 @@ onUnmounted(() => {
   font-size: 12px;
   color: #4a90c2;
   letter-spacing: 1px;
+}
+
+.trend-chart-container {
+  width: 100%;
+  height: 260px;
 }
 
 .chart-container {

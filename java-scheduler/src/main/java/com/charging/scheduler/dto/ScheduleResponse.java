@@ -32,6 +32,8 @@ public class ScheduleResponse {
 
     private LocalDateTime timestamp;
 
+    private TransitionInfoDTO transition;
+
     @Data
     @Builder
     @NoArgsConstructor
@@ -47,5 +49,22 @@ public class ScheduleResponse {
         private Double limitedMaxCurrentAmps;
 
         private Boolean isLimited;
+    }
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class TransitionInfoDTO {
+        private boolean inProgress;
+        private Double startPowerKw;
+        private Double targetPowerKw;
+        private LocalDateTime startTime;
+        private LocalDateTime endTime;
+        private Integer currentStep;
+        private Integer totalSteps;
+        private Double progressPercent;
+        private List<Double> forecastPowers;
+        private String reason;
     }
 }

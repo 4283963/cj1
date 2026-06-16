@@ -1,0 +1,29 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: charging-scheduler
+  datasource:
+    url: jdbc:postgresql://localhost:5432/charging
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+  task:
+    scheduling:
+      pool:
+        size: 4
+
+scheduler:
+  default-max-total-power-kw: 1000
+
+collector:
+  url: http://localhost:8081
